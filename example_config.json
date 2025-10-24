@@ -1,0 +1,13 @@
+{
+  "listen_port": 53,
+  "upstream_servers": [
+    {
+      "address": "8.8.8.8:53",
+      "type": "udp"
+    },
+    {
+      "address": "https://dns.google/dns-query",
+      "type": "doh"
+    }
+  ]
+}
