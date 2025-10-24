@@ -1,14 +1,18 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net"
+	"os"
+
+	"github.com/netheril96/dns-forwarder/lib"
 )
 
 func main() {
 	// Load configuration
-	config, err := LoadConfig("config.json")
+	config, err := lib.LoadConfig(os.Args[1])
 	if err != nil {
 		log.Fatalf("Failed to load configuration: %v", err)
 	}
@@ -16,7 +20,7 @@ func main() {
 	// Listen for UDP packets
 	addr := net.UDPAddr{
 		Port: config.ListenPort,
-		IP:   net.ParseIP("127.0.0.1"),
+		IP:   net.ParseIP(config.ListenAddress),
 	}
 	conn, err := net.ListenUDP("udp", &addr)
 	if err != nil {
@@ -24,7 +28,7 @@ func main() {
 	}
 	defer conn.Close()
 
-	fmt.Printf("DNS forwarder listening on port %d\n", config.ListenPort)
+	fmt.Printf("DNS forwarder listening on port %d", config.ListenPort)
 
 	for {
 		// Read from UDP
@@ -40,13 +44,14 @@ func main() {
 	}
 }
 
-func handleQuery(localConn *net.UDPConn, clientAddr *net.UDPAddr, query []byte, upstreams []UpstreamServerConfig) {
+func handleQuery(localConn *net.UDPConn, clientAddr *net.UDPAddr, query []byte, upstreams []lib.UpstreamServerConfig) {
 	// Iterate over upstream servers
-	for _, upstream := range upstreams {
+	for _, upstreamConfig := range upstreams {
+		forwarder := lib.NewForwarder(upstreamConfig)
 		// Forward query and get response
-		response, err := forwardQuery(query, upstream)
+		response, err := forwarder.Forward(context.Background(), query)
 		if err != nil {
-			log.Printf("Upstream %s failed: %v", upstream.Address, err)
+			log.Printf("Upstream %s failed: %v", upstreamConfig.Address, err)
 			continue
 		}
 

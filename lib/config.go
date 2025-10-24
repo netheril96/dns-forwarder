@@ -1,4 +1,4 @@
-package main
+package lib
 
 import (
 	"encoding/json"
@@ -8,6 +8,7 @@ import (
 // Config holds the configuration for the DNS forwarder
 
 type Config struct {
+	ListenAddress   string                 `json:"listen_address"`
 	ListenPort      int                    `json:"listen_port"`
 	UpstreamServers []UpstreamServerConfig `json:"upstream_servers"`
 }
