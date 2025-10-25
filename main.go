@@ -16,6 +16,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to load configuration: %v", err)
 	}
+	upstreamDNS, err := lib.CreateUpstreamDNS(config)
+	if err != nil {
+		log.Fatalf("Failed to create upstream DNS: %v", err)
+	}
 
 	// Listen for UDP packets
 	addr := net.UDPAddr{
@@ -40,30 +44,19 @@ func main() {
 		}
 
 		// Handle query in a new goroutine
-		go handleQuery(conn, clientAddr, buffer[:n], config.UpstreamServers)
+		go handleQuery(conn, clientAddr, buffer[:n], upstreamDNS)
 	}
 }
 
-func handleQuery(localConn *net.UDPConn, clientAddr *net.UDPAddr, query []byte, upstreams []lib.UpstreamServerConfig) {
-	// Iterate over upstream servers
-	for _, upstreamConfig := range upstreams {
-		forwarder := lib.NewForwarder(upstreamConfig)
-		// Forward query and get response
-		response, err := forwarder.Forward(context.Background(), query)
-		if err != nil {
-			log.Printf("Upstream %s failed: %v", upstreamConfig.Address, err)
-			continue
-		}
-
-		// Send response back to client
-		_, err = localConn.WriteToUDP(response, clientAddr)
-		if err != nil {
-			log.Printf("Failed to write to UDP: %v", err)
-		}
+func handleQuery(localConn *net.UDPConn, clientAddr *net.UDPAddr, query []byte, upstream lib.UpstreamDNS) {
+	response, err := upstream.Query(context.Background(), query)
+	if err != nil {
+		log.Printf("Upstream failed: %v", err)
 		return
 	}
-
-	// If all upstreams fail, send a failure response
-	// (This part is simplified and can be improved)
-	log.Printf("All upstreams failed for a query from %s", clientAddr.String())
+	// Send response back to client
+	_, err = localConn.WriteToUDP(response, clientAddr)
+	if err != nil {
+		log.Printf("Failed to write to UDP: %v", err)
+	}
 }
