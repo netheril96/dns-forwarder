@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+	"golang.org/x/net/dns/dnsmessage"
 )
 
 type UpstreamDNS interface {
@@ -202,9 +203,146 @@ func (um *UpstreamMultiple) String() string {
 	return "multiple"
 }
 
+type UpstreamHostWrapper struct {
+	inner  UpstreamDNS
+	hosts  map[dnsmessage.Question][]dnsmessage.Resource
+	logger *zap.Logger
+}
+
+func NewUpstreamHostWrapper(inner UpstreamDNS, hostsConfig Hosts, logger *zap.Logger) (*UpstreamHostWrapper, error) {
+	hosts := make(map[dnsmessage.Question][]dnsmessage.Resource)
+
+	for _, h := range hostsConfig.Predefined {
+		name, err := dnsmessage.NewName(h.Domain + ".")
+		if err != nil {
+			return nil, fmt.Errorf("invalid domain name '%s' in hosts config: %w", h.Domain, err)
+		}
+
+		// A records
+		if len(h.IPv4) > 0 {
+			qA := dnsmessage.Question{
+				Name:  name,
+				Type:  dnsmessage.TypeA,
+				Class: dnsmessage.ClassINET,
+			}
+			var answers []dnsmessage.Resource
+			for _, ipStr := range h.IPv4 {
+				ip := net.ParseIP(ipStr)
+				if ip == nil || ip.To4() == nil {
+					return nil, fmt.Errorf("invalid IPv4 address '%s' for domain '%s'", ipStr, h.Domain)
+				}
+				answers = append(answers, dnsmessage.Resource{
+					Header: dnsmessage.ResourceHeader{
+						Name:  name,
+						Type:  dnsmessage.TypeA,
+						Class: dnsmessage.ClassINET,
+						TTL:   3600, // 1 hour TTL
+					},
+					Body: &dnsmessage.AResource{A: [4]byte(ip.To4())},
+				})
+			}
+			hosts[qA] = answers
+		}
+
+		// AAAA records
+		if len(h.IPv6) > 0 {
+			qAAAA := dnsmessage.Question{
+				Name:  name,
+				Type:  dnsmessage.TypeAAAA,
+				Class: dnsmessage.ClassINET,
+			}
+			var answers []dnsmessage.Resource
+			for _, ipStr := range h.IPv6 {
+				ip := net.ParseIP(ipStr)
+				if ip == nil || ip.To16() == nil {
+					return nil, fmt.Errorf("invalid IPv6 address '%s' for domain '%s'", ipStr, h.Domain)
+				}
+				answers = append(answers, dnsmessage.Resource{
+					Header: dnsmessage.ResourceHeader{
+						Name:  name,
+						Type:  dnsmessage.TypeAAAA,
+						Class: dnsmessage.ClassINET,
+						TTL:   3600, // 1 hour TTL
+					},
+					Body: &dnsmessage.AAAAResource{AAAA: [16]byte(ip.To16())},
+				})
+			}
+			hosts[qAAAA] = answers
+		}
+	}
+
+	return &UpstreamHostWrapper{
+		inner:  inner,
+		hosts:  hosts,
+		logger: logger,
+	}, nil
+}
+
+func (u *UpstreamHostWrapper) String() string {
+	return fmt.Sprintf("host-wrapper(%s)", u.inner.String())
+}
+
+func (u *UpstreamHostWrapper) Query(ctx context.Context, query []byte) ([]byte, error) {
+	var p dnsmessage.Parser
+	header, err := p.Start(query)
+	if err != nil {
+		// If the query is unparsable, just forward it.
+		return u.inner.Query(ctx, query)
+	}
+
+	q, err := p.Question()
+	if err != nil {
+		// If there are no questions, just forward it.
+		if err != dnsmessage.ErrSectionDone {
+			u.logger.Warn("failed to parse DNS question, forwarding", zap.Error(err))
+		}
+	} else {
+		// RRL, rate limit
+		if answers, ok := u.hosts[q]; ok {
+			u.logger.Debug("serving from hosts", zap.String("domain", q.Name.String()))
+
+			// The response code should be NoError.
+			header.RCode = dnsmessage.RCodeSuccess
+			// We are sending an answer.
+			header.Response = true
+
+			builder := dnsmessage.NewBuilder(nil, header)
+			builder.EnableCompression()
+			builder.StartAnswers()
+			for _, ans := range answers {
+				var err error
+				switch ans.Body.(type) {
+				case *dnsmessage.AResource:
+					err = builder.AResource(ans.Header, *ans.Body.(*dnsmessage.AResource))
+				case *dnsmessage.AAAAResource:
+					err = builder.AAAAResource(ans.Header, *ans.Body.(*dnsmessage.AAAAResource))
+				default:
+					err = fmt.Errorf("should not happen")
+				}
+				if err != nil {
+					// This should not happen if we constructed the resource correctly.
+					u.logger.Error("failed to add resource to DNS response", zap.Error(err))
+					// Fallback to inner to be safe
+					return u.inner.Query(ctx, query)
+				}
+			}
+			return builder.Finish()
+		}
+	}
+
+	// If not in hosts or not a standard query, pass to inner upstream
+	return u.inner.Query(ctx, query)
+}
+
 func CreateUpstreamDNS(config *Config, logger *zap.Logger) (UpstreamDNS, error) {
 	if len(config.UpstreamServers) == 0 {
-		return nil, fmt.Errorf("no upstream servers configured")
+		// If there are no upstream servers, but there are hosts, we can still serve from hosts.
+		if len(config.Hosts.Predefined) > 0 {
+			// Create a dummy inner upstream that always returns an error.
+			dummy := &dummyUpstream{}
+			return NewUpstreamHostWrapper(dummy, config.Hosts, logger)
+		}
+		return nil, fmt.Errorf("no upstream servers configured and no hosts defined")
 	}
 	var upstreams []UpstreamDNS
 	dialer := &net.Dialer{}
@@ -223,5 +361,36 @@ func CreateUpstreamDNS(config *Config, logger *zap.Logger) (UpstreamDNS, error) 
 		}
 	}
 
-	return NewUpstreamMultiple(upstreams, 5*time.Second, 100*time.Second, logger)
+	var upstream UpstreamDNS
+	var err error
+
+	if len(upstreams) > 1 {
+		upstream, err = NewUpstreamMultiple(upstreams, 5*time.Second, 100*time.Second, logger)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		upstream = upstreams[0]
+	}
+
+	if len(config.Hosts.Predefined) > 0 {
+		upstream, err = NewUpstreamHostWrapper(upstream, config.Hosts, logger)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create host wrapper: %w", err)
+		}
+	}
+
+	return upstream, nil
+}
+
+// dummyUpstream is an UpstreamDNS that always returns an error.
+// It's used when no upstreams are configured but hosts are, so the host wrapper can function.
+type dummyUpstream struct{}
+
+func (d *dummyUpstream) Query(ctx context.Context, query []byte) ([]byte, error) {
+	return nil, fmt.Errorf("no upstream servers configured")
+}
+
+func (d *dummyUpstream) String() string {
+	return "dummy"
 }
