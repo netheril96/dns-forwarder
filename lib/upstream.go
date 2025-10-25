@@ -210,6 +210,22 @@ func CreateUpstreamDNS(config *Config, logger *zap.Logger) (UpstreamDNS, error) 
 	dialer := &net.Dialer{}
 	client := &http.Client{}
 
+	if config.Bootstrap != "" {
+		resolver := &net.Resolver{
+			PreferGo: true,
+			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+				d := net.Dialer{}
+				return d.DialContext(ctx, "udp", config.Bootstrap)
+			},
+		}
+		dialer.Resolver = resolver
+
+		transport := &http.Transport{
+			DialContext: dialer.DialContext,
+		}
+		client.Transport = transport
+	}
+
 	for _, upstreamConfig := range config.UpstreamServers {
 		switch upstreamConfig.Type {
 		case "udp":

@@ -11,6 +11,7 @@ type Config struct {
 	ListenAddress   string                 `json:"listen_address"`
 	ListenPort      int                    `json:"listen_port"`
 	UpstreamServers []UpstreamServerConfig `json:"upstream_servers"`
+	Bootstrap       string                 `json:"bootstrap"`
 }
 
 // UpstreamServer represents a single upstream DNS server
