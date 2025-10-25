@@ -5,11 +5,12 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"sync"
 	"time"
+
+	"go.uber.org/zap"
 )
 
 type UpstreamDNS interface {
@@ -110,12 +111,13 @@ type UpstreamMultiple struct {
 	individualTimeout time.Duration
 	retryInterval     time.Duration
 	mu                sync.Mutex // Protects access to upstreams' disabledUntil status
+	logger            *zap.Logger
 }
 
 // NewUpstreamMultiple creates a new UpstreamMultiple instance.
 // It takes a slice of UpstreamDNS, a timeout for each individual upstream query,
 // and an interval after which a failed upstream can be retried.
-func NewUpstreamMultiple(upstreams []UpstreamDNS, individualTimeout, retryInterval time.Duration) (*UpstreamMultiple, error) {
+func NewUpstreamMultiple(upstreams []UpstreamDNS, individualTimeout, retryInterval time.Duration, logger *zap.Logger) (*UpstreamMultiple, error) {
 	if len(upstreams) == 0 {
 		return nil, fmt.Errorf("UpstreamMultiple requires at least one upstream")
 	}
@@ -129,6 +131,7 @@ func NewUpstreamMultiple(upstreams []UpstreamDNS, individualTimeout, retryInterv
 		upstreams:         states,
 		individualTimeout: individualTimeout,
 		retryInterval:     retryInterval,
+		logger:            logger,
 	}, nil
 }
 
@@ -149,7 +152,7 @@ func (um *UpstreamMultiple) Query(ctx context.Context, query []byte) ([]byte, er
 		state := &um.upstreams[i]
 		if !state.disabledUntil.IsZero() && time.Now().After(state.disabledUntil) {
 			state.disabledUntil = time.Time{} // Re-enable
-			log.Printf("Upstream %s re-enabled after retry interval", state.upstream.String())
+			um.logger.Info("Upstream re-enabled after retry interval", zap.String("upstream", state.upstream.String()))
 		}
 		if state.disabledUntil.IsZero() {
 			availableUpstreams++
@@ -181,7 +184,11 @@ func (um *UpstreamMultiple) Query(ctx context.Context, query []byte) ([]byte, er
 		// Failure: disable this upstream
 		state.disabledUntil = time.Now().Add(um.retryInterval)
 		lastErr = fmt.Errorf("upstream %s failed: %w", state.upstream.String(), err)
-		log.Printf("Upstream %s disabled until %s due to error: %v", state.upstream.String(), state.disabledUntil.Format(time.RFC3339), err)
+		um.logger.Warn("Upstream disabled",
+			zap.String("upstream", state.upstream.String()),
+			zap.Time("disabledUntil", state.disabledUntil),
+			zap.Error(err),
+		)
 	}
 
 	// If we reach here, all currently available upstreams failed during this query attempt.
@@ -195,7 +202,7 @@ func (um *UpstreamMultiple) String() string {
 	return "multiple"
 }
 
-func CreateUpstreamDNS(config *Config) (UpstreamDNS, error) {
+func CreateUpstreamDNS(config *Config, logger *zap.Logger) (UpstreamDNS, error) {
 	if len(config.UpstreamServers) == 0 {
 		return nil, fmt.Errorf("no upstream servers configured")
 	}
@@ -216,5 +223,5 @@ func CreateUpstreamDNS(config *Config) (UpstreamDNS, error) {
 		}
 	}
 
-	return NewUpstreamMultiple(upstreams, 5*time.Second, 100*time.Second)
+	return NewUpstreamMultiple(upstreams, 5*time.Second, 100*time.Second, logger)
 }
