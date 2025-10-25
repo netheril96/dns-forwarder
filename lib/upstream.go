@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/miekg/dns"
 	"go.uber.org/zap"
 )
 
@@ -95,6 +96,118 @@ func (u *UpstreamDoH) Query(ctx context.Context, query []byte) ([]byte, error) {
 
 func (u *UpstreamDoH) String() string {
 	return u.address
+}
+
+// UpstreamWithECS wraps an UpstreamDNS to add an EDNS Client Subnet option.
+type UpstreamWithECS struct {
+	wrapped UpstreamDNS
+	logger  *zap.Logger
+
+	// For static subnet
+	staticSubnet *net.IPNet
+
+	// For dynamic subnet from interface
+	interfaceName string
+	prefixV6Len   int
+	mu            sync.RWMutex
+	cachedSubnet  *net.IPNet
+	cacheExpires  time.Time
+}
+
+// NewUpstreamWithECS creates a new UpstreamWithECS.
+func NewUpstreamWithECS(wrapped UpstreamDNS, config *ECSConfig, logger *zap.Logger) (*UpstreamWithECS, error) {
+	u := &UpstreamWithECS{
+		wrapped: wrapped,
+		logger:  logger,
+	}
+
+	if config.Subnet != "" {
+		_, ipNet, err := net.ParseCIDR(config.Subnet)
+		if err != nil {
+			return nil, fmt.Errorf("invalid static ECS subnet %q: %w", config.Subnet, err)
+		}
+		u.staticSubnet = ipNet
+	} else if config.Interface != "" {
+		if config.PrefixV6Len <= 0 || config.PrefixV6Len > 128 {
+			return nil, fmt.Errorf("invalid ECS prefix length for interface %s: %d", config.Interface, config.PrefixV6Len)
+		}
+		u.interfaceName = config.Interface
+		u.prefixV6Len = config.PrefixV6Len
+	} else {
+		return nil, fmt.Errorf("ECS config requires either 'subnet' or 'interface' to be set")
+	}
+
+	return u, nil
+}
+
+func (u *UpstreamWithECS) getSubnetForQuery() (*net.IPNet, error) {
+	if u.staticSubnet != nil {
+		return u.staticSubnet, nil
+	}
+
+	u.mu.RLock()
+	if u.cachedSubnet != nil && time.Now().Before(u.cacheExpires) {
+		defer u.mu.RUnlock()
+		return u.cachedSubnet, nil
+	}
+	u.mu.RUnlock()
+
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	// Double-check in case another goroutine just refreshed it
+	if u.cachedSubnet != nil && time.Now().Before(u.cacheExpires) {
+		return u.cachedSubnet, nil
+	}
+
+	iface, err := net.InterfaceByName(u.interfaceName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find interface %q: %w", u.interfaceName, err)
+	}
+
+	addrs, err := iface.Addrs()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get addresses for interface %q: %w", u.interfaceName, err)
+	}
+
+	for _, addr := range addrs {
+		ip, _, err := net.ParseCIDR(addr.String())
+		if err != nil {
+			continue
+		}
+		// We need a public, global unicast IPv6 address
+		if ip.To4() == nil && ip.IsGlobalUnicast() {
+			mask := net.CIDRMask(u.prefixV6Len, 128)
+			subnet := &net.IPNet{
+				IP:   ip.Mask(mask),
+				Mask: mask,
+			}
+			u.cachedSubnet = subnet
+			u.cacheExpires = time.Now().Add(1 * time.Hour) // Cache for 1 hour
+			u.logger.Info("Updated dynamic ECS subnet from interface",
+				zap.String("interface", u.interfaceName),
+				zap.String("subnet", subnet.String()),
+			)
+			return subnet, nil
+		}
+	}
+
+	return nil, fmt.Errorf("no suitable public IPv6 address found on interface %q", u.interfaceName)
+}
+
+func (u *UpstreamWithECS) Query(ctx context.Context, query []byte) ([]byte, error) {
+	subnet, err := u.getSubnetForQuery()
+	if err != nil {
+		u.logger.Error("Failed to get ECS subnet, forwarding query without ECS", zap.Error(err))
+		return u.wrapped.Query(ctx, query)
+	}
+
+	modifiedQuery, err := u.addECSToQuery(query, subnet)
+	if err != nil {
+		u.logger.Error("Failed to add ECS to query, forwarding original query", zap.Error(err))
+		return u.wrapped.Query(ctx, query)
+	}
+
+	return u.wrapped.Query(ctx, modifiedQuery)
 }
 
 // upstreamState holds the state for an individual upstream within UpstreamMultiple.
@@ -202,6 +315,34 @@ func (um *UpstreamMultiple) String() string {
 	return "multiple"
 }
 
+func (u *UpstreamWithECS) String() string {
+	return fmt.Sprintf("ecs(%s)", u.wrapped.String())
+}
+
+func (u *UpstreamWithECS) addECSToQuery(query []byte, subnet *net.IPNet) ([]byte, error) {
+	msg := new(dns.Msg)
+	if err := msg.Unpack(query); err != nil {
+		return nil, fmt.Errorf("failed to unpack DNS query: %w", err)
+	}
+
+	opt := msg.IsEdns0()
+	if opt == nil {
+		opt = new(dns.OPT)
+		opt.Hdr.Name = "."
+		opt.Hdr.Rrtype = dns.TypeOPT
+		msg.Extra = append(msg.Extra, opt)
+	}
+
+	prefixLen, _ := subnet.Mask.Size()
+	ecs := new(dns.EDNS0_SUBNET)
+	ecs.Code = dns.EDNS0SUBNET
+	ecs.Address = subnet.IP
+	ecs.SourceNetmask = uint8(prefixLen)
+	opt.Option = append(opt.Option, ecs)
+
+	return msg.Pack()
+}
+
 func CreateUpstreamDNS(config *Config, logger *zap.Logger) (UpstreamDNS, error) {
 	if len(config.UpstreamServers) == 0 {
 		return nil, fmt.Errorf("no upstream servers configured")
@@ -228,11 +369,21 @@ func CreateUpstreamDNS(config *Config, logger *zap.Logger) (UpstreamDNS, error) 
 
 	for _, upstreamConfig := range config.UpstreamServers {
 		switch upstreamConfig.Type {
-		case "udp":
-			upstream := NewUpstreamUDP(upstreamConfig.Address, dialer)
-			upstreams = append(upstreams, upstream)
-		case "doh":
-			upstream := NewUpstreamDoH(upstreamConfig.Address, client)
+		case "udp", "doh":
+			var upstream UpstreamDNS
+			if upstreamConfig.Type == "udp" {
+				upstream = NewUpstreamUDP(upstreamConfig.Address, dialer)
+			} else {
+				upstream = NewUpstreamDoH(upstreamConfig.Address, client)
+			}
+
+			if upstreamConfig.ECS != nil {
+				var err error
+				upstream, err = NewUpstreamWithECS(upstream, upstreamConfig.ECS, logger)
+				if err != nil {
+					return nil, fmt.Errorf("failed to create ECS wrapper for %s: %w", upstreamConfig.Address, err)
+				}
+			}
 			upstreams = append(upstreams, upstream)
 		default:
 			return nil, fmt.Errorf("unknown upstream type: %s", upstreamConfig.Type)
